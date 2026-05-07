@@ -66,6 +66,9 @@ demo/**/*.mov
 demo/**/*.webm
 demo/**/*.gif
 
+# Local demo / promo production workspace
+demo/
+
 # Manual E2E smoke tests — require live API keys (OpenRouter / yfinance),
 # would break CI if committed. Kept local; run explicitly when validating
 # a release.
