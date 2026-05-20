@@ -23,6 +23,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from src.agent.context import ContextBuilder
 from src.agent.memory import WorkspaceMemory
+from src.agent.progress import HeartbeatTimer, ProgressEvent, _set_emitter
 from src.agent.tools import ToolRegistry
 from src.agent.trace import TraceWriter
 from src.core.state import RunStateStore
@@ -33,6 +34,7 @@ RUNS_DIR = Path(__file__).resolve().parents[2] / "runs"
 TOKEN_THRESHOLD = int(os.getenv("TOKEN_THRESHOLD", "40000"))
 KEEP_RECENT = 3
 TOOL_RESULT_LIMIT = 10_000
+HEARTBEAT_INTERVAL_S = float(os.getenv("VT_HEARTBEAT_INTERVAL_S", "3.0"))
 
 # Layer 2: Context collapse thresholds
 COLLAPSE_THRESHOLD = int(TOKEN_THRESHOLD * 0.7)
@@ -435,27 +437,46 @@ class AgentLoop:
                 "react_trace": react_trace,
             }
 
-        # Determine final status
+        # Determine final status. The reason is also propagated into the
+        # returned dict so SessionService can surface a meaningful UI
+        # message instead of "Execution failed: unknown" (issue #114).
+        final_reason: str | None = None
         if self._cancelled:
-            state_store.mark_failure(run_dir, "cancelled by user")
+            final_reason = "cancelled by user"
+            state_store.mark_failure(run_dir, final_reason)
             final_status = "cancelled"
         elif (run_dir / "artifacts" / "metrics.csv").exists() or final_content:
             state_store.mark_success(run_dir)
             final_status = "success"
         else:
-            state_store.mark_failure(run_dir, "pipeline did not complete")
+            final_reason = (
+                f"reached max iterations ({self.max_iterations}) without final answer"
+            )
+            state_store.mark_failure(run_dir, final_reason)
             final_status = "failed"
 
-        trace.write({"type": "end", "status": final_status, "iterations": iteration})
+        end_event: dict[str, Any] = {
+            "type": "end",
+            "status": final_status,
+            "iterations": iteration,
+        }
+        if final_reason is not None:
+            end_event["reason"] = final_reason
+        trace.write(end_event)
         trace.close()
 
-        return {
+        result: dict[str, Any] = {
             "status": final_status,
             "run_dir": str(run_dir),
             "run_id": run_dir.name,
             "content": final_content,
             "react_trace": react_trace,
+            "iterations": iteration,
+            "max_iterations": self.max_iterations,
         }
+        if final_reason is not None:
+            result["reason"] = final_reason
+        return result
 
     # -- Tool execution with read/write batching --------------------------------
 
@@ -589,12 +610,10 @@ class AgentLoop:
             trace.write({"type": "tool_call", "iter": iteration, "tool": tc.name, "args": {k: str(v)[:200] for k, v in args.items()}})
             runnable.append((tc, args))
 
-        # Execute in parallel
+        # Execute in parallel — each worker gets its own heartbeat + progress emitter.
         def _run(tc_args: tuple) -> tuple:
             tc, args = tc_args
-            t0 = _time.perf_counter()
-            result = self.registry.execute(tc.name, args)
-            elapsed_ms = int((_time.perf_counter() - t0) * 1000)
+            result, elapsed_ms = self._invoke_tool(tc.name, args)
             return tc, result, elapsed_ms
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(runnable), 8)) as pool:
@@ -636,11 +655,48 @@ class AgentLoop:
         trace.write({"type": "tool_call", "iter": iteration, "tool": tc.name, "args": {k: str(v)[:200] for k, v in args.items()}})
         logger.info(f"Tool call: {tc.name}({list(args.keys())})")
 
-        t0 = _time.perf_counter()
-        result = self.registry.execute(tc.name, args)
-        elapsed_ms = int((_time.perf_counter() - t0) * 1000)
+        result, elapsed_ms = self._invoke_tool(tc.name, args)
 
         self._finalize_tool_result(tc, result, elapsed_ms, context, messages, trace, react_trace, iteration)
+
+    def _invoke_tool(self, tool_name: str, args: Dict[str, Any]) -> tuple[str, int]:
+        """Execute a tool with heartbeat + structured progress emission.
+
+        Installs a thread-local progress emitter so the tool may call
+        ``emit_progress()`` without taking a callback parameter, and runs a
+        background heartbeat timer that ticks every ``HEARTBEAT_INTERVAL_S``
+        seconds. Both event streams are forwarded through ``self._emit`` and
+        therefore land in the same SSE bus and CLI dashboard as normal
+        tool events.
+
+        Args:
+            tool_name: Tool name to execute.
+            args: Tool arguments dict.
+
+        Returns:
+            Tuple of (result_str, elapsed_ms).
+        """
+        def _on_progress(event: ProgressEvent) -> None:
+            payload = event.to_dict()
+            payload["tool"] = tool_name
+            self._emit("tool_progress", payload)
+
+        def _on_heartbeat(payload: Dict[str, Any]) -> None:
+            self._emit("tool_heartbeat", payload)
+
+        _set_emitter(_on_progress)
+        t0 = _time.perf_counter()
+        try:
+            with HeartbeatTimer(
+                tool_name=tool_name,
+                interval=HEARTBEAT_INTERVAL_S,
+                emit=_on_heartbeat,
+            ):
+                result = self.registry.execute(tool_name, args)
+        finally:
+            _set_emitter(None)
+        elapsed_ms = int((_time.perf_counter() - t0) * 1000)
+        return result, elapsed_ms
 
     def _finalize_tool_result(
         self,

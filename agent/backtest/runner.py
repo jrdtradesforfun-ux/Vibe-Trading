@@ -11,10 +11,9 @@ import ast
 import importlib.util
 import json
 import logging
-import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, model_validator, field_validator
@@ -32,6 +31,16 @@ from backtest.loaders.registry import (
     resolve_loader,
 )
 from backtest.loaders.base import NoAvailableSourceError
+# Symbol classification lives in ``_market_hooks`` so runner.py and
+# composite.py share a single source of truth (audit-2026-05-18 B1+C1+C2).
+# ``_detect_market`` is also re-exported here for back-compat with
+# ``agent/src/swarm/grounding.py`` and existing tests that import it
+# from ``backtest.runner``.
+from backtest.engines._market_hooks import (  # noqa: F401  (re-exported)
+    _detect_market,
+    _detect_submarket,
+    _is_china_futures,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +60,7 @@ class BacktestConfigSchema(BaseModel):
     source: str = "tushare"
     interval: str = "1D"
     engine: str = "daily"
+    fundamental_fields: Optional[Dict[str, List[str]]] = None
 
     @field_validator("codes")
     @classmethod
@@ -89,6 +99,21 @@ class BacktestConfigSchema(BaseModel):
     def valid_source(cls, v: str) -> str:
         if v not in _VALID_SOURCES:
             raise ValueError(f"unsupported source {v!r}, must be one of {_VALID_SOURCES}")
+        return v
+
+    @field_validator("fundamental_fields")
+    @classmethod
+    def valid_fundamental_fields(
+        cls,
+        v: Optional[Dict[str, List[str]]],
+    ) -> Optional[Dict[str, List[str]]]:
+        if v is None:
+            return v
+        for table, fields in v.items():
+            if not table.strip():
+                raise ValueError("fundamental_fields table names must be non-empty strings")
+            if any(not field.strip() for field in fields):
+                raise ValueError("fundamental_fields field names must be non-empty strings")
         return v
 
     @model_validator(mode="after")
@@ -223,27 +248,10 @@ def _validate_signal_engine_source(file_path: Path) -> None:
         )
 
 
-# --- Market detection (returns market type, NOT source name) ---
-
-_MARKET_PATTERNS = [
-    (re.compile(r"^\d{6}\.(SZ|SH|BJ)$", re.I), "a_share"),
-    (re.compile(r"^(51|15|56)\d{4}\.(SZ|SH)$", re.I), "a_share"),
-    (re.compile(r"^[A-Z]+\.US$", re.I), "us_equity"),
-    (re.compile(r"^\d{3,5}\.HK$", re.I), "hk_equity"),
-    (re.compile(r"^[A-Z]+-USDT$", re.I), "crypto"),
-    (re.compile(r"^[A-Z]+/USDT$", re.I), "crypto"),
-    # China futures: product+delivery.exchange (e.g. IF2406.CFFEX, rb2410.SHFE)
-    (re.compile(r"^[A-Za-z]{1,2}\d{3,4}\.(ZCE|DCE|SHFE|INE|CFFEX|GFEX)$", re.I), "futures"),
-    # Global futures: product+month-code (e.g. ESZ4, CLF25, GCM2025)
-    (re.compile(r"^[A-Z]{2,4}[FGHJKMNQUVXZ]\d{1,2}$", re.I), "futures"),
-    # Global futures: product+YYMM (e.g. CL2412, ES2503)
-    (re.compile(r"^[A-Z]{2,4}\d{4}$", re.I), "futures"),
-    # Global futures: bare product code with exchange (e.g. ES.CME)
-    (re.compile(r"^[A-Z]{2,4}\.(CME|CBOT|NYMEX|COMEX|ICE|EUREX)$", re.I), "futures"),
-    # Forex pairs: XXX/YYY or XXXXXX.FX
-    (re.compile(r"^[A-Z]{3}/[A-Z]{3}$"), "forex"),
-    (re.compile(r"^[A-Z]{6}\.FX$"), "forex"),
-]
+# --- Market detection ---
+# ``_MARKET_PATTERNS``, ``_detect_market``, ``_is_china_futures``,
+# ``_detect_submarket`` are imported from ``_market_hooks`` above and
+# re-exported here for back-compat (swarm/grounding.py, tests).
 
 # Back-compat: market type -> legacy source name (for engine selection & metrics)
 _MARKET_TO_SOURCE = {
@@ -256,22 +264,6 @@ _MARKET_TO_SOURCE = {
     "macro": "akshare",
     "forex": "akshare",
 }
-
-
-def _detect_market(code: str) -> str:
-    """Infer market type from symbol format.
-
-    Args:
-        code: Ticker / symbol string.
-
-    Returns:
-        Market type (a_share/us_equity/hk_equity/crypto/futures/forex);
-        unknown defaults to ``a_share``.
-    """
-    for pattern, market in _MARKET_PATTERNS:
-        if pattern.match(code):
-            return market
-    return "a_share"
 
 
 def _detect_source(code: str) -> str:
@@ -361,7 +353,24 @@ def main(run_dir: Path) -> None:
 
     Args:
         run_dir: Run directory containing ``config.json`` and ``code/signal_engine.py``.
+            The path is validated against the allowed run roots
+            (``VIBE_TRADING_ALLOWED_RUN_ROOTS`` plus the defaults) before any
+            file is read so an arbitrary filesystem location cannot be used
+            to source ``code/signal_engine.py``.
     """
+    # Guard the CLI entry point with the same root whitelist the MCP
+    # ``backtest`` tool already uses (src/tools/backtest_tool.py:23). Without
+    # this, ``python -m backtest.runner /tmp/attacker_path`` would happily
+    # import ``signal_engine.py`` from anywhere on disk; the AST scrubber
+    # below blocks executable top-level statements but a method body still
+    # runs on instantiation. See ``safe_run_dir`` for the policy.
+    from src.tools.path_utils import safe_run_dir
+    try:
+        run_dir = safe_run_dir(str(run_dir))
+    except ValueError as exc:
+        print(json.dumps({"error": str(exc)}))
+        sys.exit(1)
+
     config_path = run_dir / "config.json"
     if not config_path.exists():
         print(json.dumps({"error": "config.json not found"}))
@@ -432,6 +441,11 @@ def main(run_dir: Path) -> None:
     if not data_map:
         print(json.dumps({"error": "No data fetched"}))
         sys.exit(1)
+
+    if source == "auto":
+        config["_run_card_effective_sources"] = sorted(_group_codes_by_source(codes))
+    else:
+        config["_run_card_effective_sources"] = [source]
 
     # Engine
     engine_type = config.get("engine", "daily")
@@ -516,54 +530,6 @@ def _create_market_engine(source: str, config: dict, codes: List[str]):
         return CryptoEngine(config)
 
 
-def _is_china_futures(code: str) -> bool:
-    """Check if a futures code belongs to a Chinese exchange.
-
-    Args:
-        code: Symbol string (e.g. 'IF2406.CFFEX', 'rb2410.SHFE').
-
-    Returns:
-        True if it matches a Chinese futures exchange suffix.
-    """
-    china_exchanges = {"CFFEX", "SHFE", "DCE", "ZCE", "INE", "GFEX"}
-    parts = code.upper().split(".")
-    if len(parts) == 2 and parts[1] in china_exchanges:
-        return True
-    # Heuristic: Chinese futures product codes
-    m = re.match(r"([A-Za-z]+)\d+", parts[0])
-    if m:
-        product = m.group(1)
-        # Known Chinese futures products (partial list)
-        cn_products = {
-            "IF", "IC", "IH", "IM", "T", "TF", "TS", "TL",
-            "au", "ag", "cu", "al", "zn", "pb", "ni", "sn", "ss",
-            "rb", "hc", "i", "j", "jm",
-            "sc", "fu", "lu", "bu", "nr",
-            "c", "cs", "m", "y", "a", "p", "jd", "lh",
-            "CF", "SR", "TA", "MA", "AP", "RM", "OI",
-            "pp", "l", "v", "eg", "eb", "PF", "SA", "FG", "UR",
-            "si", "lc",
-        }
-        if product in cn_products:
-            return True
-    return False
-
-
-def _detect_submarket(codes: List[str]) -> str:
-    """Detect US vs HK from symbol suffixes.
-
-    Args:
-        codes: Instrument codes.
-
-    Returns:
-        "hk" if any code ends with .HK, else "us".
-    """
-    for code in codes:
-        if code.upper().endswith(".HK"):
-            return "hk"
-    return "us"
-
-
 def _detect_primary_source(codes: List[str], source: str) -> str:
     """Pick primary source for annualization (e.g. bars per year).
 
@@ -646,6 +612,6 @@ class _AutoLoader:
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print(f"Usage: python -m backtest.runner <run_dir>")
+        print("Usage: python -m backtest.runner <run_dir>")
         sys.exit(1)
     main(Path(sys.argv[1]))
