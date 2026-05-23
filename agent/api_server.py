@@ -11,6 +11,7 @@ import hmac
 import ipaddress
 import json
 import os
+import re
 import signal
 import time
 import csv
@@ -295,6 +296,61 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ----------------------------------------------------------------------------
+# SPA deep-link fallback
+# ----------------------------------------------------------------------------
+# A handful of API routes share their path with frontend SPA routes (e.g.
+# ``/runs/{id}`` and ``/correlation``). Because FastAPI matches registered
+# routes before the static SPA mount, a browser that refreshes or bookmarks
+# one of these URLs would receive JSON (or 401/422) instead of the SPA shell.
+# The middleware below serves ``frontend/dist/index.html`` when the request
+# clearly came from a browser (``Accept`` contains ``text/html``); programmatic
+# clients are routed to the real API handler as before.
+#
+# Patterns are written narrowly so the SPA shell only shadows paths that
+# actually correspond to frontend pages. In particular ``/runs/{id}`` is
+# the RunDetail page, but ``/runs/{id}/code`` and ``/runs/{id}/pine`` are
+# API-only endpoints with no SPA route — using a broad ``/runs/`` prefix
+# here would incorrectly hijack those when the browser sets ``Accept:
+# text/html`` (e.g. a user pasting the URL into the address bar).
+
+_FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+_SPA_HTML_EXACT_PATHS: frozenset[str] = frozenset({"/correlation"})
+# Each regex matches a complete request path. Trailing slash optional.
+_SPA_HTML_PATH_REGEX: tuple[re.Pattern[str], ...] = (
+    # ``/runs/{run_id}`` — RunDetail page. Excludes ``/runs/{id}/code``,
+    # ``/runs/{id}/pine`` (API only) and ``/runs`` (collection endpoint).
+    re.compile(r"^/runs/[^/]+/?$"),
+)
+
+
+def _is_spa_html_route(path: str) -> bool:
+    """Return True when ``path`` corresponds to a frontend SPA page that
+    shadows an API endpoint and should fall back to ``index.html`` on
+    browser navigation."""
+    if path in _SPA_HTML_EXACT_PATHS:
+        return True
+    return any(pattern.match(path) for pattern in _SPA_HTML_PATH_REGEX)
+
+
+@app.middleware("http")
+async def _spa_html_deep_link_fallback(request: Request, call_next):
+    """Serve ``frontend/dist/index.html`` when a browser navigates directly to
+    an SPA path that also exists as an API endpoint.
+
+    Conflicts: ``/runs/{id}`` (RunDetail page vs API) and ``/correlation``
+    (Correlation page vs API). Programmatic clients (``Accept: */*`` or
+    ``application/json``) still hit the real API handler.
+    """
+    if request.method == "GET":
+        accept = request.headers.get("accept", "")
+        if "text/html" in accept and _is_spa_html_route(request.url.path):
+            index = _FRONTEND_DIST / "index.html"
+            if index.exists():
+                return FileResponse(str(index))
+    return await call_next(request)
 
 
 @app.on_event("startup")
@@ -1631,46 +1687,45 @@ async def create_swarm_run(payload: dict, http_request: Request):
 
 @app.get("/swarm/runs", dependencies=[Depends(require_auth)])
 async def list_swarm_runs(limit: int = Query(20, ge=1, le=100)):
-    """List swarm runs (newest first)."""
+    """List swarm runs (newest first), reconciled."""
     runtime = _get_swarm_runtime()
     runs = runtime._store.list_runs(limit=limit)
-    return [
-        {
-            "id": r.id,
-            "preset_name": r.preset_name,
-            "status": r.status.value,
-            "created_at": r.created_at,
-            "task_count": len(r.tasks),
-            "completed_count": sum(1 for t in r.tasks if t.status.value == "completed"),
-        }
-        for r in runs
-    ]
+    items = []
+    for r in runs:
+        # Reconcile each row: a zombie running run will be auto-finalized so
+        # the dashboard never shows a permanent "running" stuck row.
+        reconciled = runtime._store.reconcile_run(r, write=True)
+        items.append(
+            {
+                "id": reconciled.id,
+                "preset_name": reconciled.preset_name,
+                "status": reconciled.status.value,
+                "is_stale": runtime._store.is_run_stale(reconciled),
+                "created_at": reconciled.created_at,
+                "completed_at": reconciled.completed_at,
+                "task_count": len(reconciled.tasks),
+                "completed_count": sum(1 for t in reconciled.tasks if t.status.value == "completed"),
+            }
+        )
+    return items
 
 
 @app.get("/swarm/runs/{run_id}", dependencies=[Depends(require_auth)])
 async def get_swarm_run(run_id: str):
-    """Swarm run detail including task statuses."""
-    from src.swarm.task_store import TaskStore
-
+    """Swarm run detail including task statuses (reconciled)."""
     _validate_path_param(run_id, "run_id")
     runtime = _get_swarm_runtime()
-    run = runtime._store.load_run(run_id)
-    if not run:
+    loaded = runtime._store.load_run(run_id)
+    if not loaded:
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
 
-    # Merge real-time task statuses from task_store (updated during execution)
-    run_dir = runtime._store.run_dir(run_id)
-    tasks_dir = run_dir / "tasks"
-    if tasks_dir.exists():
-        task_store = TaskStore(run_dir)
-        live_tasks = task_store.load_all()
-        if live_tasks:
-            run.tasks = live_tasks
+    run = runtime._store.reconcile_run(loaded, write=True)
 
     return {
         "id": run.id,
         "preset_name": run.preset_name,
         "status": run.status.value,
+        "is_stale": runtime._store.is_run_stale(run),
         "user_vars": run.user_vars,
         "agents": [a.model_dump() for a in run.agents],
         "tasks": [t.model_dump() for t in run.tasks],
@@ -1698,9 +1753,14 @@ async def swarm_run_events(run_id: str, request: Request, last_index: int = Quer
                 idx += 1
                 yield f"id: {idx}\nevent: {evt.type}\ndata: {json.dumps(evt.model_dump(), ensure_ascii=False)}\n\n"
             run = runtime._store.load_run(run_id)
-            if run and run.status.value in ("completed", "failed", "cancelled"):
-                yield f"event: done\ndata: {{\"status\": \"{run.status.value}\"}}\n\n"
-                break
+            if run:
+                # Reconcile so a zombie running run can still close this SSE
+                # stream cleanly — without it, a dead host would keep the
+                # stream open forever and block the dashboard's "done" state.
+                reconciled = runtime._store.reconcile_run(run, write=True)
+                if reconciled.status.value in ("completed", "failed", "cancelled"):
+                    yield f"event: done\ndata: {{\"status\": \"{reconciled.status.value}\"}}\n\n"
+                    break
             await asyncio.sleep(2)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

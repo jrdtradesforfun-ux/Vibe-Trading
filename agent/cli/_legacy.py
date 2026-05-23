@@ -35,7 +35,6 @@ for _s in ("stdout", "stderr"):
     if callable(_r):
         _r(encoding="utf-8", errors="replace")
 
-from rich.console import Console
 from rich import box
 from rich.columns import Columns
 from rich.live import Live
@@ -46,8 +45,10 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
-console = Console()
-AGENT_DIR = Path(__file__).resolve().parent
+from cli.theme import get_console
+
+console = get_console()
+AGENT_DIR = Path(__file__).resolve().parents[1]
 RUNS_DIR = AGENT_DIR / "runs"
 SWARM_DIR = AGENT_DIR / ".swarm" / "runs"
 SESSIONS_DIR = AGENT_DIR / "sessions"
@@ -58,7 +59,7 @@ EXIT_RUN_FAILED = 1
 EXIT_USAGE_ERROR = 2
 RICH_TAG_PATTERN = re.compile(r"\[/?[^\]]+\]")
 
-_VERSION = "0.1.7"
+from cli._version import __version__ as _VERSION  # noqa: E402 — single source of truth
 
 # Agent color assignments for swarm display
 _AGENT_STYLES = ["cyan", "magenta", "green", "yellow", "blue", "bright_red", "bright_cyan", "bright_magenta"]
@@ -783,6 +784,9 @@ class _RunDashboard:
         return Panel(body, title="Vibe-Trading", border_style="cyan", padding=(1, 1 if compact else 2))
 
 
+from cli.ui.rail import RailRunDashboard as _RunDashboard  # noqa: E402,F811
+
+
 # ---------------------------------------------------------------------------
 # Agent execution core
 # ---------------------------------------------------------------------------
@@ -1240,6 +1244,7 @@ def cmd_run(prompt: str, max_iter: int, *, json_mode: bool = False, no_rich: boo
             with Live(dashboard.render(), console=console, refresh_per_second=6, transient=True) as live:
                 dashboard.live = live
                 result = _run_agent(prompt, max_iter=max_iter, dashboard=dashboard)
+                dashboard.finish(result, time.perf_counter() - start)
     except KeyboardInterrupt:
         if json_mode:
             _print_json_result({"status": "cancelled", "run_id": None, "run_dir": None, "reason": "Interrupted"})
@@ -1333,6 +1338,7 @@ def cmd_continue(
                 max_iter=max_iter,
                 dashboard=dashboard,
             )
+            dashboard.finish(result, time.perf_counter() - start)
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted[/yellow]")
         return EXIT_RUN_FAILED
@@ -1726,6 +1732,7 @@ def cmd_interactive(max_iter: int) -> None:
             with Live(dashboard.render(), console=console, refresh_per_second=6, transient=True) as live:
                 dashboard.live = live
                 result = _run_agent(user_input, history=history[-6:], max_iter=max_iter, dashboard=dashboard)
+                dashboard.finish(result, time.perf_counter() - start)
         except KeyboardInterrupt:
             console.print("\n[yellow]Interrupted[/yellow]")
             continue
@@ -2694,7 +2701,7 @@ _PROVIDER_CHOICES: list[dict[str, str | None]] = [
         "key_env": "OPENROUTER_API_KEY",
         "base_env": "OPENROUTER_BASE_URL",
         "base_url": "https://openrouter.ai/api/v1",
-        "model": "deepseek/deepseek-v3.2",
+        "model": "deepseek/deepseek-v4-pro",
         "key_prefix": "sk-or-",
         "key_placeholder": "sk-or-v1-...",
     },
@@ -2704,7 +2711,7 @@ _PROVIDER_CHOICES: list[dict[str, str | None]] = [
         "key_env": "DEEPSEEK_API_KEY",
         "base_env": "DEEPSEEK_BASE_URL",
         "base_url": "https://api.deepseek.com/v1",
-        "model": "deepseek-chat",
+        "model": "deepseek-v4-pro",
         "key_prefix": "sk-",
         "key_placeholder": "sk-...",
     },
@@ -2714,7 +2721,7 @@ _PROVIDER_CHOICES: list[dict[str, str | None]] = [
         "key_env": "OPENAI_API_KEY",
         "base_env": "OPENAI_BASE_URL",
         "base_url": "https://api.openai.com/v1",
-        "model": "gpt-4o",
+        "model": "gpt-5.5-instant",
         "key_prefix": "sk-",
         "key_placeholder": "sk-...",
     },
@@ -2724,7 +2731,7 @@ _PROVIDER_CHOICES: list[dict[str, str | None]] = [
         "key_env": "GEMINI_API_KEY",
         "base_env": "GEMINI_BASE_URL",
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-        "model": "gemini-2.5-flash",
+        "model": "gemini-3.5-flash",
         "key_prefix": None,
         "key_placeholder": "api-key...",
     },
@@ -2734,7 +2741,7 @@ _PROVIDER_CHOICES: list[dict[str, str | None]] = [
         "key_env": "GROQ_API_KEY",
         "base_env": "GROQ_BASE_URL",
         "base_url": "https://api.groq.com/openai/v1",
-        "model": "llama-3.3-70b-versatile",
+        "model": "meta-llama/llama-4-maverick-17b-128e-instruct",
         "key_prefix": "gsk_",
         "key_placeholder": "gsk_...",
     },
@@ -2744,7 +2751,7 @@ _PROVIDER_CHOICES: list[dict[str, str | None]] = [
         "key_env": "DASHSCOPE_API_KEY",
         "base_env": "DASHSCOPE_BASE_URL",
         "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "model": "qwen-plus",
+        "model": "qwen-plus-latest",
         "key_prefix": "sk-",
         "key_placeholder": "sk-...",
     },
@@ -2754,7 +2761,7 @@ _PROVIDER_CHOICES: list[dict[str, str | None]] = [
         "key_env": "ZHIPU_API_KEY",
         "base_env": "ZHIPU_BASE_URL",
         "base_url": "https://open.bigmodel.cn/api/paas/v4",
-        "model": "glm-4-plus",
+        "model": "glm-5.1",
         "key_prefix": None,
         "key_placeholder": "api-key...",
     },
@@ -2764,7 +2771,7 @@ _PROVIDER_CHOICES: list[dict[str, str | None]] = [
         "key_env": "MOONSHOT_API_KEY",
         "base_env": "MOONSHOT_BASE_URL",
         "base_url": "https://api.moonshot.ai/v1",
-        "model": "kimi-k2.5",
+        "model": "kimi-k2.6",
         "key_prefix": "sk-",
         "key_placeholder": "sk-...",
     },
@@ -2774,7 +2781,7 @@ _PROVIDER_CHOICES: list[dict[str, str | None]] = [
         "key_env": "MINIMAX_API_KEY",
         "base_env": "MINIMAX_BASE_URL",
         "base_url": "https://api.minimax.io/v1",
-        "model": "MiniMax-Text-01",
+        "model": "MiniMax-M2.7",
         "key_prefix": None,
         "key_placeholder": "api-key...",
     },
@@ -3117,6 +3124,10 @@ def main(argv: list[str] | None = None) -> int:
         args = parser.parse_args(raw_argv)
     except SystemExit as exc:
         return int(exc.code) if isinstance(exc.code, int) else EXIT_USAGE_ERROR
+    if not sys.stdout.isatty():
+        args.no_rich = True
+        if hasattr(args, "run_no_rich"):
+            args.run_no_rich = True
 
     if args.command == "init":
         return cmd_init()
